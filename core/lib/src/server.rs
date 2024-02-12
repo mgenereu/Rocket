@@ -7,32 +7,31 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use futures::{Future, TryFutureExt, future::{select, Either::*}};
-use tokio::time::sleep;
 
-use crate::{Request, Rocket, Orbit, Data, Ignite};
+use crate::{Data, Orbit, Request, Rocket};
 use crate::request::ConnectionMeta;
 use crate::erased::{ErasedRequest, ErasedResponse, ErasedIoHandler};
 use crate::listener::{Listener, CancellableExt, BouncedExt};
-use crate::error::{Error, ErrorKind};
-use crate::data::IoStream;
+use crate::data::{IoStream, RawStream};
 use crate::util::ReaderStream;
 use crate::http::Status;
 
+type Result<T, E = crate::Error> = std::result::Result<T, E>;
+
 impl Rocket<Orbit> {
-    async fn service(
+    async fn service<T: Into<RawStream<'static>>>(
         self: Arc<Self>,
-        mut req: hyper::Request<hyper::body::Incoming>,
+        parts: http::request::Parts,
+        stream: T,
+        upgrade: Option<hyper::upgrade::OnUpgrade>,
         connection: ConnectionMeta,
     ) -> Result<hyper::Response<ReaderStream<ErasedResponse>>, http::Error> {
-        let upgrade = hyper::upgrade::on(&mut req);
-        let (parts, incoming) = req.into_parts();
         let request = ErasedRequest::new(self, parts, |rocket, parts| {
             Request::from_hyp(rocket, parts, connection).unwrap_or_else(|e| e)
         });
 
         let mut response = request.into_response(
-            incoming,
-            |incoming| Data::from(incoming),
+            Data::from(stream),
             |rocket, request, data| Box::pin(rocket.preprocess(request, data)),
             |token, rocket, request, data| Box::pin(async move {
                 if !request.errors.is_empty() {
@@ -46,7 +45,7 @@ impl Rocket<Orbit> {
         ).await;
 
         let io_handler = response.to_io_handler(Rocket::extract_io_handler);
-        if let Some(handler) = io_handler {
+        if let (Some(handler), Some(upgrade)) = (io_handler, upgrade) {
             let upgrade = upgrade.map_ok(IoStream::from).map_err(io::Error::other);
             tokio::task::spawn(io_handler_task(upgrade, handler));
         }
@@ -83,8 +82,8 @@ async fn io_handler_task<S>(stream: S, mut handler: ErasedIoHandler)
     }
 }
 
-impl Rocket<Ignite> {
-    pub(crate) async fn serve<L>(self, listener: L) -> Result<Self, crate::Error>
+impl Rocket<Orbit> {
+    pub(crate) async fn serve<L>(self: Arc<Self>, listener: L) -> Result<()>
         where L: Listener + 'static
     {
         let mut builder = Builder::new(TokioExecutor::new());
@@ -107,17 +106,19 @@ impl Rocket<Ignite> {
         }
 
         let listener = listener.bounced().cancellable(self.shutdown(), &self.config.shutdown);
-        let rocket = Arc::new(self.into_orbit(listener.socket_addr()?));
-        let _ = tokio::spawn(Rocket::liftoff(rocket.clone())).await;
-
         let (server, listener) = (Arc::new(builder), Arc::new(listener));
         while let Some(accept) = listener.accept_next().await {
-            let (listener, rocket, server) = (listener.clone(), rocket.clone(), server.clone());
+            let (listener, rocket, server) = (listener.clone(), self.clone(), server.clone());
             tokio::spawn({
                 let result = async move {
                     let conn = TokioIo::new(listener.connect(accept).await?);
                     let meta = ConnectionMeta::from(conn.inner());
-                    let service = service_fn(|req| rocket.clone().service(req, meta.clone()));
+                    let service = service_fn(|mut req| {
+                        let upgrade = hyper::upgrade::on(&mut req);
+                        let (parts, incoming) = req.into_parts();
+                        rocket.clone().service(parts, incoming, Some(upgrade), meta.clone())
+                    });
+
                     let serve = pin!(server.serve_connection_with_upgrades(conn, service));
                     match select(serve, rocket.shutdown()).await {
                         Left((result, _)) => result,
@@ -132,49 +133,58 @@ impl Rocket<Ignite> {
             });
         }
 
-        // Rocket wraps all connections in a `CancellableIo` struct, an internal
-        // structure that gracefully closes I/O when it receives a signal. That
-        // signal is the `shutdown` future. When the future resolves,
-        // `CancellableIo` begins to terminate in grace, mercy, and finally
-        // force close phases. Since all connections are wrapped in
-        // `CancellableIo`, this eventually ends all I/O.
-        //
-        // At that point, unless a user spawned an infinite, stand-alone task
-        // that isn't monitoring `Shutdown`, all tasks should resolve. This
-        // means that all instances of the shared `Arc<Rocket>` are dropped and
-        // we can return the owned instance of `Rocket`.
-        //
-        // Unfortunately, the Hyper `server` future resolves as soon as it has
-        // finished processing requests without respect for ongoing responses.
-        // That is, `server` resolves even when there are running tasks that are
-        // generating a response. So, `server` resolving implies little to
-        // nothing about the state of connections. As a result, we depend on the
-        // timing of grace + mercy + some buffer to determine when all
-        // connections should be closed, thus all tasks should be complete, thus
-        // all references to `Arc<Rocket>` should be dropped and we can get back
-        // a unique reference.
-        info!("Shutting down. Waiting for shutdown fairings and pending I/O...");
-        tokio::spawn({
-            let rocket = rocket.clone();
-            async move { rocket.fairings.handle_shutdown(&*rocket).await }
-        });
+        Ok(())
+    }
+}
 
-        let config = &rocket.config.shutdown;
-        let wait = Duration::from_micros(250);
-        for period in [wait, config.grace(), wait, config.mercy(), wait * 4] {
-            if Arc::strong_count(&rocket) == 1 { break }
-            sleep(period).await;
+#[cfg(feature = "http3")]
+impl Rocket<Orbit> {
+    pub(crate) async fn serve3<L>(self: Arc<Self>, listener: L) -> Result<()>
+        where L: Listener<Accept = s2n_quic::Connection> + 'static
+    {
+        use crate::listener::quic::Void;
+        use tokio_stream::StreamExt;
+        use s2n_quic_h3 as quic_h3;
+
+        type H3Conn = quic_h3::h3::server::Connection<quic_h3::Connection, bytes::Bytes>;
+
+        let listener = listener.bounced().cancellable(self.shutdown(), &self.config.shutdown);
+        let listener = Arc::new(listener);
+        while let Some(accept) = listener.accept_next().await {
+            let rocket = self.clone();
+            tokio::spawn({
+                let result = async move {
+                    let void = Void(accept.handle().local_addr()?);
+                    let quic_conn = quic_h3::Connection::new(accept);
+                    let mut h3 = H3Conn::new(quic_conn).await.map_err(io::Error::other)?;
+                    while let Some((req, stream)) = h3.accept().await.map_err(io::Error::other)? {
+                        let rocket = rocket.clone();
+                        tokio::spawn(async move {
+                            let (mut tx, rx) = stream.split();
+                            let (parts, _) = req.into_parts();
+                            let response = rocket
+                                .service(parts, rx, None, ConnectionMeta::from(&void)).await
+                                .map_err(io::Error::other)?;
+
+                            let (r, mut stream) = response.into_parts();
+                            let response = http::Response::from_parts(r, ());
+                            tx.send_response(response).await.map_err(io::Error::other)?;
+
+                            while let Some(Ok(bytes)) = stream.next().await {
+                                tx.send_data(bytes).await.map_err(io::Error::other)?;
+                            }
+
+                            tx.finish().await.map_err(io::Error::other)
+                        }).await.map_err(io::Error::other)??;
+                    }
+
+                    Ok(())
+                };
+
+                result.inspect_err(crate::error::log_server_error)
+            });
         }
 
-        match Arc::try_unwrap(rocket) {
-            Ok(rocket) => {
-                info!("Graceful shutdown completed successfully.");
-                Ok(rocket.into_ignite())
-            }
-            Err(rocket) => {
-                warn!("Shutdown failed: outstanding background I/O.");
-                Err(Error::new(ErrorKind::Shutdown(rocket)))
-            }
-        }
+        Ok(())
     }
 }

@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use std::path::Path;
 use std::io::{self, Cursor};
 
-use futures::ready;
+use futures::{ready, FutureExt};
 use futures::stream::Stream;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, ReadBuf, Take};
@@ -65,10 +65,15 @@ pub type BaseReader<'r> = Take<Chain<Cursor<Vec<u8>>, RawReader<'r>>>;
 /// Direct reader to the underlying data stream. Not limited in any manner.
 pub type RawReader<'r> = StreamReader<RawStream<'r>, Bytes>;
 
+#[cfg(feature = "http3")]
+use s2n_quic_h3::{self as quic, h3};
+
 /// Raw underlying data stream.
 pub enum RawStream<'r> {
     Empty,
-    Body(&'r mut HyperBody),
+    Body(HyperBody),
+    #[cfg(feature = "http3")]
+    H3Body(h3::server::RequestStream<quic::RecvStream, Bytes>),
     Multipart(multer::Field<'r>),
 }
 
@@ -343,7 +348,17 @@ impl Stream for RawStream<'_> {
                     .poll_frame(cx)
                     .map_ok(|frame| frame.into_data().unwrap_or_else(|_| Bytes::new()))
                     .map_err(io::Error::other)
-            }
+            },
+            #[cfg(feature = "http3")]
+            RawStream::H3Body(stream) => {
+                use bytes::Buf;
+
+                match ready!(stream.poll_recv_data(cx)) {
+                    Ok(Some(mut buf)) => Poll::Ready(Some(Ok(buf.copy_to_bytes(buf.remaining())))),
+                    Ok(None) => Poll::Ready(None),
+                    Err(e) => Poll::Ready(Some(Err(io::Error::other(e)))),
+                }
+            },
             RawStream::Multipart(s) => Pin::new(s).poll_next(cx).map_err(io::Error::other),
             RawStream::Empty => Poll::Ready(None),
         }
@@ -356,6 +371,8 @@ impl Stream for RawStream<'_> {
                 let (lower, upper) = (hint.lower(), hint.upper());
                 (lower as usize, upper.map(|x| x as usize))
             },
+            #[cfg(feature = "http3")]
+            RawStream::H3Body(_) => (0, Some(0)),
             RawStream::Multipart(mp) => mp.size_hint(),
             RawStream::Empty => (0, Some(0)),
         }
@@ -367,14 +384,23 @@ impl std::fmt::Display for RawStream<'_> {
         match self {
             RawStream::Empty => f.write_str("empty stream"),
             RawStream::Body(_) => f.write_str("request body"),
+            #[cfg(feature = "http3")]
+            RawStream::H3Body(_) => f.write_str("http3 quic stream"),
             RawStream::Multipart(_) => f.write_str("multipart form field"),
         }
     }
 }
 
-impl<'r> From<&'r mut HyperBody> for RawStream<'r> {
-    fn from(value: &'r mut HyperBody) -> Self {
+impl<'r> From<HyperBody> for RawStream<'r> {
+    fn from(value: HyperBody) -> Self {
         Self::Body(value)
+    }
+}
+
+#[cfg(feature = "http3")]
+impl<'r> From<h3::server::RequestStream<quic::RecvStream, Bytes>> for RawStream<'r> {
+    fn from(value: h3::server::RequestStream<quic::RecvStream, Bytes>) -> Self {
+        Self::H3Body(value)
     }
 }
 

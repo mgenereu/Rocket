@@ -54,6 +54,7 @@ pin_project! {
     }
 }
 
+#[derive(Debug)]
 enum State {
     /// I/O has not been cancelled. Proceed as normal.
     Active,
@@ -97,11 +98,11 @@ pub trait CancellableExt: Sized {
 impl<L: Listener> CancellableExt for L { }
 
 fn time_out() -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, "Shutdown grace timed out")
+    io::Error::new(io::ErrorKind::TimedOut, "shutdown grace period elapsed")
 }
 
 fn gone() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "IO driver has terminated")
+    io::Error::new(io::ErrorKind::BrokenPipe, "I/O driver terminated")
 }
 
 impl<L, F> CancellableListener<F, Bounced<L>>
@@ -162,7 +163,7 @@ impl<L, F> Listener for CancellableListener<F, L>
 }
 
 impl<F: Future, I: AsyncWrite> CancellableIo<F, I> {
-    fn inner(&self) -> Option<&I> {
+    pub fn inner(&self) -> Option<&I> {
         self.io.as_ref()
     }
 
@@ -171,7 +172,7 @@ impl<F: Future, I: AsyncWrite> CancellableIo<F, I> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         do_io: impl FnOnce(Pin<&mut I>, &mut Context<'_>) -> Poll<io::Result<T>>,
-    ) -> Poll<io::Result<T>> {
+    ) -> Poll<io::Result<Option<T>>> {
         let mut me = self.as_mut().project();
         let io = match me.io.as_pin_mut() {
             Some(io) => io,
@@ -184,14 +185,14 @@ impl<F: Future, I: AsyncWrite> CancellableIo<F, I> {
                     if me.trigger.as_mut().poll(cx).is_ready() {
                         *me.state = State::Grace(Box::pin(sleep(*me.grace)));
                     } else {
-                        return do_io(io, cx);
+                        return do_io(io, cx).map_ok(Some);
                     }
                 }
                 State::Grace(timer) => {
                     if timer.as_mut().poll(cx).is_ready() {
                         *me.state = State::Mercy(Box::pin(sleep(*me.mercy)));
                     } else {
-                        return do_io(io, cx);
+                        return do_io(io, cx).map_ok(Some);
                     }
                 }
                 State::Mercy(timer) => {
@@ -218,7 +219,9 @@ impl<F: Future, I: AsyncRead + AsyncWrite> AsyncRead for CancellableIo<F, I> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.as_mut().poll_trigger_then(cx, |io, cx| io.poll_read(cx, buf))
+        self.as_mut()
+            .poll_trigger_then(cx, |io, cx| io.poll_read(cx, buf))
+            .map_ok(|ok| ok.unwrap_or_default())
     }
 }
 
@@ -228,21 +231,27 @@ impl<F: Future, I: AsyncWrite> AsyncWrite for CancellableIo<F, I> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.as_mut().poll_trigger_then(cx, |io, cx| io.poll_write(cx, buf))
+        self.as_mut()
+            .poll_trigger_then(cx, |io, cx| io.poll_write(cx, buf))
+            .map_ok(|ok| ok.unwrap_or_default())
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>
     ) -> Poll<io::Result<()>> {
-        self.as_mut().poll_trigger_then(cx, |io, cx| io.poll_flush(cx))
+        self.as_mut()
+            .poll_trigger_then(cx, |io, cx| io.poll_flush(cx))
+            .map_ok(|ok| ok.unwrap_or_default())
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>
     ) -> Poll<io::Result<()>> {
-        self.as_mut().poll_trigger_then(cx, |io, cx| io.poll_shutdown(cx))
+        self.as_mut()
+            .poll_trigger_then(cx, |io, cx| io.poll_shutdown(cx))
+            .map_ok(|ok| ok.unwrap_or_default())
     }
 
     fn poll_write_vectored(
@@ -250,7 +259,9 @@ impl<F: Future, I: AsyncWrite> AsyncWrite for CancellableIo<F, I> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.as_mut().poll_trigger_then(cx, |io, cx| io.poll_write_vectored(cx, bufs))
+        self.as_mut()
+            .poll_trigger_then(cx, |io, cx| io.poll_write_vectored(cx, bufs))
+            .map_ok(|ok| ok.unwrap_or_default())
     }
 
     fn is_write_vectored(&self) -> bool {

@@ -27,7 +27,7 @@ pub struct TlsBindable<I> {
 }
 
 impl TlsConfig {
-    pub(crate) fn acceptor(&self) -> Result<tokio_rustls::TlsAcceptor, Error> {
+    pub(crate) fn server_config(&self) -> Result<ServerConfig, Error> {
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: self.ciphers().map(|c| c.into()).collect(),
             ..rustls::crypto::ring::default_provider()
@@ -64,7 +64,7 @@ impl TlsConfig {
             tls_config.alpn_protocols.insert(0, b"h2".to_vec());
         }
 
-        Ok(TlsAcceptor::from(Arc::new(tls_config)))
+        Ok(tls_config)
     }
 }
 
@@ -75,7 +75,7 @@ impl<I: Bindable> Bindable for TlsBindable<I> {
 
     async fn bind(self) -> Result<Self::Listener, Self::Error> {
         Ok(TlsListener {
-            acceptor: self.tls.acceptor()?,
+            acceptor: TlsAcceptor::from(Arc::new(self.tls.server_config()?)),
             listener: self.inner.bind().await.map_err(|e| Error::Bind(Box::new(e)))?,
             config: self.tls,
         })

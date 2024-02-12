@@ -39,6 +39,7 @@ impl Endpoint {
     pub fn tcp(&self) -> Option<TcpAddr> {
         match self {
             Endpoint::Tcp(addr) => Some(*addr),
+            Endpoint::Tls(addr, _) => addr.tcp(),
             _ => None,
         }
     }
@@ -46,6 +47,7 @@ impl Endpoint {
     pub fn unix(&self) -> Option<&Path> {
         match self {
             Endpoint::Unix(addr) => Some(addr),
+            Endpoint::Tls(addr, _) => addr.unix(),
             _ => None,
         }
     }

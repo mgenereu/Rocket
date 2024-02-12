@@ -1,12 +1,14 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::time::Duration;
 
 use yansi::Paint;
 use either::Either;
 use figment::{Figment, Provider};
 
 use crate::{Catcher, Config, Route, Shutdown, sentinel, shield::Shield};
-use crate::listener::{Endpoint, Bindable, DefaultListener};
+use crate::listener::{Bindable, DefaultListener, Endpoint, Listener};
 use crate::router::Router;
 use crate::util::TripWire;
 use crate::fairing::{Fairing, Fairings};
@@ -688,12 +690,78 @@ impl Rocket<Ignite> {
     }
 
     async fn _launch_on<B: Bindable>(self, bindable: B) -> Result<Rocket<Ignite>, Error> {
-        let listener = bindable.bind().await.map_err(|e| ErrorKind::Bind(Box::new(e)))?;
-        self.serve(listener).await
+        let listener = bindable.bind().await
+            .map_err(|e| ErrorKind::Bind(Box::new(e)))?;
+
+        let rocket = Arc::new(self.into_orbit(listener.socket_addr()?));
+        if let Err(e) = tokio::spawn(Rocket::liftoff(rocket.clone())).await {
+            let rocket = rocket.try_wait_shutdown().await;
+            return Err(ErrorKind::Liftoff(rocket, Box::new(e)).into());
+        }
+
+        // #[cfg(not(feature = "http3"))] {
+        //     rocket.clone().serve(listener).await?;
+        // }
+
+        // #[cfg(feature = "http3")] {
+        //     // let (r1, r2) = tokio::join!(
+        //     //     tokio::task::spawn(rocket.clone().serve(listener)),
+        //     //     tokio::task::spawn(rocket.clone().serve3(listener)),
+        //     // );
+        // }
+
+        rocket.clone().serve(listener).await?;
+        Ok(rocket.try_wait_shutdown().await.map_err(ErrorKind::Shutdown)?)
     }
 }
 
 impl Rocket<Orbit> {
+    /// Rocket wraps all connections in a `CancellableIo` struct, an internal
+    /// structure that gracefully closes I/O when it receives a signal. That
+    /// signal is the `shutdown` future. When the future resolves,
+    /// `CancellableIo` begins to terminate in grace, mercy, and finally force
+    /// close phases. Since all connections are wrapped in `CancellableIo`, this
+    /// eventually ends all I/O.
+    ///
+    /// At that point, unless a user spawned an infinite, stand-alone task that
+    /// isn't monitoring `Shutdown`, all tasks should resolve. This means that
+    /// all instances of the shared `Arc<Rocket>` are dropped and we can return
+    /// the owned instance of `Rocket`.
+    ///
+    /// Unfortunately, the Hyper `server` future resolves as soon as it has
+    /// finished processing requests without respect for ongoing responses. That
+    /// is, `server` resolves even when there are running tasks that are
+    /// generating a response. So, `server` resolving implies little to nothing
+    /// about the state of connections. As a result, we depend on the timing of
+    /// grace + mercy + some buffer to determine when all connections should be
+    /// closed, thus all tasks should be complete, thus all references to
+    /// `Arc<Rocket>` should be dropped and we can get back a unique reference.
+    async fn try_wait_shutdown(self: Arc<Self>) -> Result<Rocket<Ignite>, Arc<Self>> {
+        info!("Shutting down. Waiting for shutdown fairings and pending I/O...");
+        tokio::spawn({
+            let rocket = self.clone();
+            async move { rocket.fairings.handle_shutdown(&*rocket).await }
+        });
+
+        let config = &self.config.shutdown;
+        let wait = Duration::from_micros(250);
+        for period in [wait, config.grace(), wait, config.mercy(), wait * 4] {
+            if Arc::strong_count(&self) == 1 { break }
+            tokio::time::sleep(period).await;
+        }
+
+        match Arc::try_unwrap(self) {
+            Ok(rocket) => {
+                info!("Graceful shutdown completed successfully.");
+                Ok(rocket.into_ignite())
+            }
+            Err(rocket) => {
+                warn!("Shutdown failed: outstanding background I/O.");
+                Err(rocket)
+            }
+        }
+    }
+
     pub(crate) fn into_ignite(self) -> Rocket<Ignite> {
         Rocket(Igniting {
             router: self.0.router,
