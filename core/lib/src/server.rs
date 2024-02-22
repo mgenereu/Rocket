@@ -159,23 +159,23 @@ impl Rocket<Orbit> {
                     let mut h3 = H3Conn::new(quic_conn).await.map_err(io::Error::other)?;
                     while let Some((req, stream)) = h3.accept().await.map_err(io::Error::other)? {
                         let rocket = rocket.clone();
-                        tokio::spawn(async move {
-                            let (mut tx, rx) = stream.split();
-                            let (parts, _) = req.into_parts();
-                            let response = rocket
-                                .service(parts, rx, None, ConnectionMeta::from(&void)).await
-                                .map_err(io::Error::other)?;
-
-                            let (r, mut stream) = response.into_parts();
-                            let response = http::Response::from_parts(r, ());
-                            tx.send_response(response).await.map_err(io::Error::other)?;
-
-                            while let Some(Ok(bytes)) = stream.next().await {
-                                tx.send_data(bytes).await.map_err(io::Error::other)?;
-                            }
-
-                            tx.finish().await.map_err(io::Error::other)
-                        }).await.map_err(io::Error::other)??;
+                        // tokio::spawn(async move {
+                        //     let (mut tx, rx) = stream.split();
+                        //     let (parts, _) = req.into_parts();
+                        //     let response = rocket
+                        //         .service(parts, rx, None, ConnectionMeta::from(&void)).await
+                        //         .map_err(io::Error::other)?;
+                        //
+                        //     let (r, mut stream) = response.into_parts();
+                        //     let response = http::Response::from_parts(r, ());
+                        //     tx.send_response(response).await.map_err(io::Error::other)?;
+                        //
+                        //     while let Some(Ok(bytes)) = stream.next().await {
+                        //         tx.send_data(bytes).await.map_err(io::Error::other)?;
+                        //     }
+                        //
+                        //     tx.finish().await.map_err(io::Error::other)
+                        // }).await.map_err(io::Error::other)??;
                     }
 
                     Ok(())
